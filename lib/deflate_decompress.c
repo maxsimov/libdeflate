@@ -1069,10 +1069,31 @@ build_offset_decode_table(struct libdeflate_decompressor *d,
  *                         Main decompression routine
  *****************************************************************************/
 
+/*
+ * Slice 060 (tablespoon fork): the inner-template signature gains
+ * five optional parameters for zran-style random access. The
+ * existing libdeflate_deflate_decompress_ex entrypoint passes 0 /
+ * NULL / 0 / NULL / NULL to keep its behaviour byte-identical to
+ * upstream — `init_bitbuf` / `init_bitsleft` become the initial
+ * bit-buffer state (seeded from a saved checkpoint on resume; 0 on
+ * a fresh call), `stop_at_block_end` opts into returning
+ * LIBDEFLATE_BLOCK_END at non-final block boundaries, and
+ * `bitbuf_out` / `bitsleft_out` receive the live state at that
+ * boundary so the caller can checkpoint.
+ *
+ * Per-byte overhead on the default path is zero: the new params
+ * are read at function entry (one extra mov per init), and the
+ * stop_at_block_end check fires once per DEFLATE block (~16-128 KB)
+ * — lost in the noise relative to the inner symbol-decode loop.
+ */
 typedef enum libdeflate_result (*decompress_func_t)
 	(struct libdeflate_decompressor * restrict d,
 	 const void * restrict in, size_t in_nbytes,
 	 void * restrict out, size_t out_nbytes_avail,
+	 u64 init_bitbuf, u32 init_bitsleft,
+	 size_t out_offset,
+	 int stop_at_block_end,
+	 u64 *bitbuf_out, u32 *bitsleft_out,
 	 size_t *actual_in_nbytes_ret, size_t *actual_out_nbytes_ret);
 
 #define FUNCNAME deflate_decompress_default
@@ -1115,6 +1136,12 @@ dispatch_decomp(struct libdeflate_decompressor * restrict d,
 
 	decompress_impl = f;
 	return f(d, in, in_nbytes, out, out_nbytes_avail,
+		 /* init_bitbuf  = */ 0,
+		 /* init_bitsleft = */ 0,
+		 /* out_offset   = */ 0,
+		 /* stop_at_block_end = */ 0,
+		 /* bitbuf_out  = */ NULL,
+		 /* bitsleft_out = */ NULL,
 		 actual_in_nbytes_ret, actual_out_nbytes_ret);
 }
 #else
@@ -1138,7 +1165,95 @@ libdeflate_deflate_decompress_ex(struct libdeflate_decompressor *d,
 				 size_t *actual_out_nbytes_ret)
 {
 	return decompress_impl(d, in, in_nbytes, out, out_nbytes_avail,
+			       /* init_bitbuf       = */ 0,
+			       /* init_bitsleft     = */ 0,
+			       /* out_offset        = */ 0,
+			       /* stop_at_block_end = */ 0,
+			       /* bitbuf_out        = */ NULL,
+			       /* bitsleft_out      = */ NULL,
 			       actual_in_nbytes_ret, actual_out_nbytes_ret);
+}
+
+/* ─── Slice 060 fork: zran-style walk + resume ────────────────────── */
+
+/*
+ * libdeflate_deflate_decompress_walk()
+ *
+ * Decompress one or more DEFLATE blocks from `in` into `out`,
+ * resuming a prior session via `init_bitbuf` + `init_bitsleft` +
+ * `out_offset`. The decoder starts writing at `out + out_offset`
+ * and resolves back-references into `[out, out + out_offset)` so
+ * the caller's growing output buffer is treated as one contiguous
+ * stream. With `stop_at_block_end=1` the decoder returns
+ * LIBDEFLATE_BLOCK_END at each non-final block boundary; the
+ * caller updates `out_offset` from `*actual_out_nbytes_ret` and
+ * feeds back the returned `*bitbuf_out` / `*bitsleft_out` on the
+ * next call.
+ *
+ * For a fresh start: pass 0/0/0 for init_bitbuf / init_bitsleft /
+ * out_offset.
+ */
+LIBDEFLATEAPI enum libdeflate_result
+libdeflate_deflate_decompress_walk(struct libdeflate_decompressor *d,
+				   const void *in, size_t in_nbytes,
+				   void *out, size_t out_nbytes_avail,
+				   uint64_t init_bitbuf,
+				   uint32_t init_bitsleft,
+				   size_t out_offset,
+				   int stop_at_block_end,
+				   uint64_t *bitbuf_out,
+				   uint32_t *bitsleft_out,
+				   size_t *actual_in_nbytes_ret,
+				   size_t *actual_out_nbytes_ret)
+{
+	if (out_offset > out_nbytes_avail)
+		return LIBDEFLATE_INSUFFICIENT_SPACE;
+	return decompress_impl(d, in, in_nbytes, out, out_nbytes_avail,
+			       init_bitbuf, init_bitsleft, out_offset,
+			       stop_at_block_end,
+			       bitbuf_out, bitsleft_out,
+			       actual_in_nbytes_ret, actual_out_nbytes_ret);
+}
+
+/*
+ * libdeflate_deflate_decompress_resume()
+ *
+ * Resume decompression from a checkpoint saved by a prior
+ * libdeflate_deflate_decompress_walk() return at LIBDEFLATE_BLOCK_END.
+ * The caller hands the last (up to 32 KiB) of the prior output as
+ * `dict_window`; this wrapper copies it into the start of the
+ * output buffer and runs the decoder with `out_offset = dict_nbytes`
+ * so back-references that reach back into the dictionary resolve
+ * correctly.
+ *
+ * Sub-byte cursor: a checkpoint's `saved_bitsleft` is the bit
+ * offset within the byte at `compressed[saved_offset]`. The
+ * decoder seeds those bits into its bit buffer and reads new bytes
+ * from `in` (which should point to `compressed[saved_offset]`).
+ */
+LIBDEFLATEAPI enum libdeflate_result
+libdeflate_deflate_decompress_resume(struct libdeflate_decompressor *d,
+				     const void *in, size_t in_nbytes,
+				     void *out, size_t out_nbytes_avail,
+				     uint64_t saved_bitbuf,
+				     uint32_t saved_bitsleft,
+				     const void *dict_window,
+				     size_t dict_nbytes,
+				     size_t *actual_in_nbytes_ret,
+				     size_t *actual_out_nbytes_ret)
+{
+	if (dict_nbytes > 32768 || dict_nbytes > out_nbytes_avail)
+		return LIBDEFLATE_INSUFFICIENT_SPACE;
+	if (dict_nbytes > 0)
+		memcpy(out, dict_window, dict_nbytes);
+	return libdeflate_deflate_decompress_walk(
+		d, in, in_nbytes, out, out_nbytes_avail,
+		saved_bitbuf, saved_bitsleft,
+		dict_nbytes,
+		/* stop_at_block_end = */ 0,
+		/* bitbuf_out        = */ NULL,
+		/* bitsleft_out      = */ NULL,
+		actual_in_nbytes_ret, actual_out_nbytes_ret);
 }
 
 LIBDEFLATEAPI enum libdeflate_result

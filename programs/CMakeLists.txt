@@ -102,6 +102,7 @@ if(LIBDEFLATE_BUILD_TESTS)
         test_overread
         test_slow_decompression
         test_trailing_bytes
+        test_zran
     )
     foreach(PROG ${UNIT_TEST_PROGS})
         add_executable(${PROG} ${PROG}.c)

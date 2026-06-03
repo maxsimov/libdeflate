@@ -45,21 +45,46 @@ static ATTRIBUTES MAYBE_UNUSED enum libdeflate_result
 FUNCNAME(struct libdeflate_decompressor * restrict d,
 	 const void * restrict in, size_t in_nbytes,
 	 void * restrict out, size_t out_nbytes_avail,
+	 u64 init_bitbuf, u32 init_bitsleft,
+	 size_t out_offset,
+	 int stop_at_block_end,
+	 u64 *bitbuf_out, u32 *bitsleft_out,
 	 size_t *actual_in_nbytes_ret, size_t *actual_out_nbytes_ret)
 {
-	u8 *out_next = out;
-	u8 * const out_end = out_next + out_nbytes_avail;
+	/*
+	 * Slice 060 fork: `out_offset` lets the decoder start writing
+	 * partway into the caller's output buffer. Back-references
+	 * naturally resolve into the bytes at `[out, out + out_offset)`
+	 * because the safety check `offset <= out_next - out` allows
+	 * distances up to `out_next - out`, and out_next is initialised
+	 * to `out + out_offset`. This is the mechanism that lets
+	 * walk-walk continuation work (caller's growing buffer holds
+	 * all prior output) and how dictionary-priming for `resume`
+	 * works (caller pre-copies the dict to `out[0..]` and sets
+	 * `out_offset = dict_nbytes`).
+	 *
+	 * Existing callers (libdeflate_deflate_decompress_ex) pass
+	 * out_offset = 0 so this is byte-for-byte equivalent to the
+	 * upstream behaviour.
+	 */
+	u8 *out_next = (u8 *)out + out_offset;
+	u8 * const out_end = (u8 *)out + out_nbytes_avail;
 	u8 * const out_fastloop_end =
-		out_end - MIN(out_nbytes_avail, FASTLOOP_MAX_BYTES_WRITTEN);
+		out_end - MIN(out_nbytes_avail - out_offset, FASTLOOP_MAX_BYTES_WRITTEN);
 
 	/* Input bitstream state; see deflate_decompress.c for documentation */
 	const u8 *in_next = in;
 	const u8 * const in_end = in_next + in_nbytes;
 	const u8 * const in_fastloop_end =
 		in_end - MIN(in_nbytes, FASTLOOP_MAX_BYTES_READ);
-	bitbuf_t bitbuf = 0;
+	/*
+	 * Slice 060 fork: seed bit-buffer state from caller's saved
+	 * checkpoint (or 0 on a fresh call). All existing callers pass
+	 * 0/0 so upstream default-path behaviour is preserved.
+	 */
+	bitbuf_t bitbuf = (bitbuf_t)init_bitbuf;
 	bitbuf_t saved_bitbuf;
-	u32 bitsleft = 0;
+	u32 bitsleft = init_bitsleft;
 	size_t overread_count = 0;
 
 	bool is_final_block;
@@ -740,8 +765,65 @@ generic_loop:
 block_done:
 	/* Finished decoding a block */
 
-	if (!is_final_block)
+	if (!is_final_block) {
+		/*
+		 * Slice 060 fork: opt-in stop-at-end-of-block hook.
+		 * When the caller set stop_at_block_end != 0, capture
+		 * the live bit-buffer state (bitbuf, bitsleft) — together
+		 * with the consumed input + produced output reported
+		 * below, the caller has the complete zran checkpoint
+		 * tuple. bitsleft is masked to its low 8 bits to match
+		 * the contract upstream applies on the final-block exit
+		 * path (see immediately below); the high bits may
+		 * contain garbage from CAN_CONSUME accounting.
+		 *
+		 * Per-block overhead on the default path (stop_at_block_end=0):
+		 * one zero-tested branch per block. Blocks span ~16-128 KB
+		 * of input each — this fires once per ~16 KB and adds
+		 * nanoseconds; lost in the inner-loop noise.
+		 */
+		if (stop_at_block_end) {
+			/*
+			 * Mirror the BFINAL exit path's bookkeeping:
+			 *
+			 *   1. Cast `bitsleft` to u8 (high bits are
+			 *      documented garbage).
+			 *   2. Rewind `in_next` by the number of refilled-
+			 *      but-unconsumed full bytes (bitsleft >> 3),
+			 *      minus any "overread" bytes that were actually
+			 *      beyond EOF. After this, `in_next` points at
+			 *      the byte that contains the sub-byte cursor
+			 *      (or at the byte after, when the cursor is
+			 *      byte-aligned).
+			 *   3. Reduce `bitsleft` to the sub-byte cursor
+			 *      count (0..=7) and mask `bitbuf` accordingly.
+			 *      The caller saves these and feeds them back as
+			 *      init_bitbuf / init_bitsleft on the next call,
+			 *      either to walk the next block (continuation)
+			 *      or to resume later from a stored checkpoint.
+			 *
+			 * This shape mirrors zlib's `Z_BLOCK` flush +
+			 * `inflatePrime` resume contract: the saved state
+			 * is the sub-byte cursor, not the entire refilled
+			 * bit-buffer window.
+			 */
+			bitsleft = (u8)bitsleft;
+			SAFETY_CHECK(overread_count <= (bitsleft >> 3));
+			in_next -= (bitsleft >> 3) - overread_count;
+			bitsleft &= 7;
+			bitbuf &= ((bitbuf_t)1 << bitsleft) - 1;
+			if (bitbuf_out)
+				*bitbuf_out = (u64)bitbuf;
+			if (bitsleft_out)
+				*bitsleft_out = bitsleft;
+			if (actual_in_nbytes_ret)
+				*actual_in_nbytes_ret = in_next - (const u8 *)in;
+			if (actual_out_nbytes_ret)
+				*actual_out_nbytes_ret = out_next - ((u8 *)out + out_offset);
+			return LIBDEFLATE_BLOCK_END;
+		}
 		goto next_block;
+	}
 
 	/* That was the last block. */
 
@@ -763,7 +845,7 @@ block_done:
 
 	/* Optionally return the actual number of bytes written. */
 	if (actual_out_nbytes_ret) {
-		*actual_out_nbytes_ret = out_next - (u8 *)out;
+		*actual_out_nbytes_ret = out_next - ((u8 *)out + out_offset);
 	} else {
 		if (out_next != out_end)
 			return LIBDEFLATE_SHORT_OUTPUT;

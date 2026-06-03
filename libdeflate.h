@@ -206,6 +206,13 @@ enum libdeflate_result {
 	/* The data would have decompressed to more than 'out_nbytes_avail'
 	 * bytes.  */
 	LIBDEFLATE_INSUFFICIENT_SPACE = 3,
+
+	/* Slice 060 fork: returned by libdeflate_deflate_decompress_walk()
+	 * with the stop_at_block_end flag when the decoder reaches an
+	 * end-of-block boundary that is not the final block. The caller
+	 * extracts the saved (bitbuf, bitsleft) and decides whether to
+	 * keep calling. */
+	LIBDEFLATE_BLOCK_END = 4,
 };
 
 /*
@@ -257,6 +264,87 @@ libdeflate_deflate_decompress_ex(struct libdeflate_decompressor *decompressor,
 				 void *out, size_t out_nbytes_avail,
 				 size_t *actual_in_nbytes_ret,
 				 size_t *actual_out_nbytes_ret);
+
+/* ─── Slice 060 fork: zran-style resume + walk ─────────────────────
+ *
+ * Together these two entrypoints are the minimum sufficient surface
+ * for zran-style random access into a gzip / DEFLATE stream:
+ *
+ *   - Use libdeflate_deflate_decompress_walk() with stop_at_block_end=1
+ *     at index-build time. The decoder returns at each non-final
+ *     end-of-block boundary; the caller captures
+ *     (input_byte_position, *bitbuf_out, *bitsleft_out,
+ *      last 32 KiB of output) as a checkpoint.
+ *   - Use libdeflate_deflate_decompress_resume() at random-access
+ *     read time. The caller supplies the saved bitbuf/bitsleft + the
+ *     32 KiB sliding-window dictionary; decompression resumes from
+ *     the checkpoint as if it had been continuous.
+ *
+ * Wrapper-format streams (gzip, zlib) are out of scope here — these
+ * operate on raw DEFLATE. The caller parses the gzip header at index
+ * build, then forgets about it; resume / walk see only DEFLATE.
+ */
+
+/*
+ * libdeflate_deflate_decompress_walk() decompresses with optional
+ * stops at end-of-block boundaries.
+ *
+ * Behaviour matches libdeflate_deflate_decompress_ex() except: if
+ * 'stop_at_block_end' is nonzero and the decoder reaches the end of
+ * a non-final block, *bitbuf_out and *bitsleft_out receive the live
+ * state, *actual_in_nbytes_ret and *actual_out_nbytes_ret reflect
+ * what was consumed/produced up to that point, and the function
+ * returns LIBDEFLATE_BLOCK_END. With 'stop_at_block_end' = 0, the
+ * function is byte-identical to libdeflate_deflate_decompress_ex().
+ *
+ * 'bitbuf_out' and 'bitsleft_out' may be NULL, in which case the
+ * state at the block boundary is discarded; useful when the caller
+ * just wants to count block boundaries.
+ */
+LIBDEFLATEAPI enum libdeflate_result
+libdeflate_deflate_decompress_walk(struct libdeflate_decompressor *decompressor,
+				   const void *in, size_t in_nbytes,
+				   void *out, size_t out_nbytes_avail,
+				   uint64_t init_bitbuf,
+				   uint32_t init_bitsleft,
+				   size_t out_offset,
+				   int stop_at_block_end,
+				   uint64_t *bitbuf_out,
+				   uint32_t *bitsleft_out,
+				   size_t *actual_in_nbytes_ret,
+				   size_t *actual_out_nbytes_ret);
+
+/*
+ * libdeflate_deflate_decompress_resume() resumes raw DEFLATE
+ * decompression from a saved checkpoint.
+ *
+ * 'saved_bitbuf' and 'saved_bitsleft' must come from a previous
+ * libdeflate_deflate_decompress_walk() return at LIBDEFLATE_BLOCK_END.
+ * 'dict_window' is a buffer of 'dict_nbytes' (≤ 32768) bytes
+ * containing the most recent uncompressed bytes that preceded the
+ * resume point (the DEFLATE sliding window). The decompressor
+ * pre-copies it into the output buffer prefix before writing actual
+ * decompressed output. The first 'dict_nbytes' bytes of 'out' are
+ * overwritten with that copy; decompressed output starts at
+ * out + dict_nbytes and runs for the byte count returned in
+ * *actual_out_nbytes_ret.
+ *
+ * Returns LIBDEFLATE_SUCCESS at end-of-stream, LIBDEFLATE_BAD_DATA
+ * on corrupt input, or LIBDEFLATE_INSUFFICIENT_SPACE if 'dict_nbytes'
+ * > 'out_nbytes_avail' or 'dict_nbytes' > 32768.
+ *
+ * Does not support stopping mid-stream; for that, use _walk().
+ */
+LIBDEFLATEAPI enum libdeflate_result
+libdeflate_deflate_decompress_resume(struct libdeflate_decompressor *decompressor,
+				     const void *in, size_t in_nbytes,
+				     void *out, size_t out_nbytes_avail,
+				     uint64_t saved_bitbuf,
+				     uint32_t saved_bitsleft,
+				     const void *dict_window,
+				     size_t dict_nbytes,
+				     size_t *actual_in_nbytes_ret,
+				     size_t *actual_out_nbytes_ret);
 
 /*
  * Like libdeflate_deflate_decompress(), but assumes the zlib wrapper format
